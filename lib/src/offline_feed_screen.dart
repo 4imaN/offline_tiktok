@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'feed_mixer.dart';
 import 'local_video_page.dart';
@@ -21,10 +22,12 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
     with SingleTickerProviderStateMixin {
   static const int _initialBatchSize = 200;
   static const int _backgroundBatchSize = 200;
+  static const String _favoriteIdsStorageKey = 'favorite_asset_ids';
 
   final PageController _forYouController = PageController();
   final PageController _likedController = PageController();
   late final TabController _tabController;
+  late final Future<SharedPreferences> _preferences;
 
   _FeedState _state = _FeedState.loading;
   List<MixedVideo> _videos = const [];
@@ -33,13 +36,14 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
   int _likedIndex = 0;
   bool _clearMode = false;
   bool _soundOn = true;
-  bool _isLoadingMore = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
+    _preferences = SharedPreferences.getInstance();
     _tabController = TabController(length: 2, vsync: this);
+    unawaited(_restoreFavorites());
     _loadFeed();
   }
 
@@ -63,7 +67,6 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
     setState(() {
       _state = _FeedState.loading;
       _errorMessage = null;
-      _isLoadingMore = false;
     });
 
     try {
@@ -116,9 +119,13 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
         return;
       }
 
+      final favoriteCountBeforePrune = _favoriteIds.length;
       _favoriteIds.removeWhere(
         (assetId) => mix.every((video) => video.asset.id != assetId),
       );
+      if (favoriteCountBeforePrune != _favoriteIds.length) {
+        unawaited(_persistFavorites());
+      }
 
       setState(() {
         _videos = mix;
@@ -163,12 +170,6 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
       return;
     }
 
-    if (mounted) {
-      setState(() {
-        _isLoadingMore = true;
-      });
-    }
-
     final allAssets = [...existingAssets];
 
     try {
@@ -196,11 +197,6 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
         }
       }
     } finally {
-      if (mounted) {
-        setState(() {
-          _isLoadingMore = false;
-        });
-      }
     }
   }
 
@@ -256,6 +252,7 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
       }
       _normalizeLikedIndex();
     });
+    unawaited(_persistFavorites());
   }
 
   void _likeFromDoubleTap(String assetId) {
@@ -266,6 +263,30 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
       _favoriteIds.add(assetId);
       _normalizeLikedIndex();
     });
+    unawaited(_persistFavorites());
+  }
+
+  Future<void> _restoreFavorites() async {
+    final preferences = await _preferences;
+    final stored = preferences.getStringList(_favoriteIdsStorageKey) ?? const [];
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _favoriteIds
+        ..clear()
+        ..addAll(stored);
+      _normalizeLikedIndex();
+    });
+  }
+
+  Future<void> _persistFavorites() async {
+    final preferences = await _preferences;
+    await preferences.setStringList(
+      _favoriteIdsStorageKey,
+      _favoriteIds.toList(growable: false),
+    );
   }
 
   Future<void> _shareVideo(MixedVideo video) async {
@@ -324,7 +345,7 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
       itemBuilder: (context, index) {
         final video = videos[index];
         return LocalVideoPage(
-          key: ValueKey('${video.asset.id}-${_clearMode ? 'clear' : 'full'}'),
+          key: ValueKey(video.asset.id),
           video: video,
           active: index == currentIndex,
           isFavorite: _favoriteIds.contains(video.asset.id),
@@ -424,94 +445,43 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
                   child: Padding(
                     padding: const EdgeInsets.all(16),
                     child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                      crossAxisAlignment: CrossAxisAlignment.center,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Row(
-                          children: [
-                            const _AppLogo(),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    'Offline TikTok',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleLarge
-                                        ?.copyWith(fontWeight: FontWeight.w900),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    '${_videos.length} local videos${_isLoadingMore ? ' · loading more' : ''} · ${_favoriteIds.length} liked',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(color: Colors.white70),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            _HeaderButton(
-                              icon: _soundOn
-                                  ? Icons.volume_up_rounded
-                                  : Icons.volume_off_rounded,
-                              onPressed: () {
-                                setState(() {
-                                  _soundOn = !_soundOn;
-                                });
-                              },
-                            ),
-                            const SizedBox(width: 12),
-                            _HeaderButton(
-                              icon: Icons.refresh_rounded,
-                              onPressed: _loadFeed,
-                            ),
+                        TabBar(
+                          controller: _tabController,
+                          isScrollable: true,
+                          tabAlignment: TabAlignment.center,
+                          indicatorColor: const Color(0xFFFF7A18),
+                          indicatorWeight: 3,
+                          indicatorSize: TabBarIndicatorSize.label,
+                          dividerColor: Colors.transparent,
+                          labelColor: Colors.white,
+                          unselectedLabelColor: Colors.white70,
+                          labelStyle: Theme.of(context)
+                              .textTheme
+                              .titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                          unselectedLabelStyle: Theme.of(context)
+                              .textTheme
+                              .titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w600),
+                          overlayColor: WidgetStateProperty.all(
+                            Colors.transparent,
+                          ),
+                          tabs: const [
+                            Tab(text: 'For You'),
+                            Tab(text: 'Liked'),
                           ],
                         ),
                         const SizedBox(height: 14),
-                        Container(
-                          decoration: BoxDecoration(
-                            color: const Color(0x99102232),
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(color: Colors.white24),
-                          ),
-                          child: TabBar(
-                            controller: _tabController,
-                            indicator: BoxDecoration(
-                              borderRadius: BorderRadius.circular(999),
-                              gradient: const LinearGradient(
-                                colors: [Color(0xFFFF7A18), Color(0xFFFF5678)],
-                              ),
-                            ),
-                            dividerColor: Colors.transparent,
-                            labelColor: Colors.white,
-                            unselectedLabelColor: Colors.white70,
-                            tabs: const [
-                              Tab(text: 'For You'),
-                              Tab(text: 'Liked'),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 14),
                         Row(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
                             _PillButton(
                               label: 'Shuffle',
                               icon: Icons.shuffle_rounded,
                               onPressed: _reshuffle,
-                            ),
-                            const SizedBox(width: 10),
-                            _PillButton(
-                              label: 'Clear View',
-                              icon: Icons.crop_free_rounded,
-                              onPressed: () {
-                                setState(() {
-                                  _clearMode = true;
-                                });
-                              },
                             ),
                           ],
                         ),
@@ -523,68 +493,6 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
           ),
         ),
       },
-    );
-  }
-}
-
-class _AppLogo extends StatelessWidget {
-  const _AppLogo();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 44,
-      height: 44,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFFFF7A18), Color(0xFFFF5678), Color(0xFF00C2A8)],
-        ),
-        boxShadow: const [
-          BoxShadow(color: Color(0x55FF7A18), blurRadius: 18, spreadRadius: 1),
-        ],
-      ),
-      child: const Stack(
-        alignment: Alignment.center,
-        children: [
-          Positioned(
-            top: 7,
-            left: 8,
-            child: Icon(
-              Icons.play_arrow_rounded,
-              size: 16,
-              color: Colors.black,
-            ),
-          ),
-          Positioned(
-            right: 8,
-            bottom: 6,
-            child: Icon(Icons.bolt_rounded, size: 18, color: Colors.black),
-          ),
-          Icon(Icons.favorite_rounded, size: 16, color: Colors.white),
-        ],
-      ),
-    );
-  }
-}
-
-class _HeaderButton extends StatelessWidget {
-  const _HeaderButton({required this.icon, required this.onPressed});
-
-  final IconData icon;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: const Color(0x99102232),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.white24),
-      ),
-      child: IconButton(onPressed: onPressed, icon: Icon(icon)),
     );
   }
 }

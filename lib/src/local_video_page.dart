@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
@@ -36,11 +37,22 @@ class LocalVideoPage extends StatefulWidget {
 }
 
 class _LocalVideoPageState extends State<LocalVideoPage> {
+  static const Duration _doubleTapWindow = Duration(milliseconds: 280);
+  static const Duration _pauseDelay = Duration(milliseconds: 140);
+  static const Duration _autoplayRecoveryDelay = Duration(milliseconds: 220);
+
   VideoPlayerController? _controller;
+  Timer? _autoplayRecoveryTimer;
+  Timer? _pendingPauseTimer;
   String? _error;
   bool _initializing = true;
+  bool _isPausedByUser = false;
+  bool _isPlaying = false;
+  bool _didToggleOnLastTap = false;
+  bool _wasPlayingBeforeLastTap = false;
   bool _showHeartBurst = false;
   int _heartBurstId = 0;
+  DateTime? _lastTapAt;
 
   @override
   void initState() {
@@ -67,9 +79,15 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
     }
 
     if (widget.active) {
-      controller.play();
+      if (!_isPausedByUser) {
+        controller.play();
+        _syncPlaybackState(true);
+        _scheduleAutoplayRecovery();
+      }
     } else {
+      _autoplayRecoveryTimer?.cancel();
       controller.pause();
+      _syncPlaybackState(false);
     }
   }
 
@@ -98,6 +116,10 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
       _controller = controller;
       if (widget.active) {
         await controller.play();
+        _syncPlaybackState(true);
+        _scheduleAutoplayRecovery();
+      } else {
+        _syncPlaybackState(false);
       }
     } catch (error) {
       _error = error.toString();
@@ -111,10 +133,95 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
   }
 
   void _handleDoubleTap() {
+    _pendingPauseTimer?.cancel();
+    _pendingPauseTimer = null;
+    _restorePlaybackAfterDoubleTap();
     _burstHeart();
     if (!widget.isFavorite) {
       widget.onDoubleTapLike();
     }
+  }
+
+  void _handleTapUp() {
+    final now = DateTime.now();
+    final lastTapAt = _lastTapAt;
+    _lastTapAt = now;
+
+    if (lastTapAt != null && now.difference(lastTapAt) <= _doubleTapWindow) {
+      _lastTapAt = null;
+      _handleDoubleTap();
+      return;
+    }
+
+    _handleSingleTap();
+  }
+
+  void _handleSingleTap() {
+    if (widget.clearMode) {
+      _didToggleOnLastTap = false;
+      widget.onToggleClearMode();
+      return;
+    }
+
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      _didToggleOnLastTap = false;
+      return;
+    }
+
+    _wasPlayingBeforeLastTap = _isPlaying;
+    _didToggleOnLastTap = false;
+
+    if (_isPlaying) {
+      _didToggleOnLastTap = true;
+      _pendingPauseTimer?.cancel();
+      _pendingPauseTimer = Timer(_pauseDelay, () {
+        if (!mounted) {
+          return;
+        }
+        final activeController = _controller;
+        if (activeController == null || !activeController.value.isInitialized) {
+          return;
+        }
+        activeController.pause();
+        _isPausedByUser = true;
+        _syncPlaybackState(false);
+      });
+      return;
+    }
+
+    if (!widget.active) {
+      return;
+    }
+
+    controller.play();
+    _isPausedByUser = false;
+    _didToggleOnLastTap = true;
+    _syncPlaybackState(true);
+  }
+
+  void _restorePlaybackAfterDoubleTap() {
+    if (!_didToggleOnLastTap) {
+      return;
+    }
+
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      _didToggleOnLastTap = false;
+      return;
+    }
+
+    if (_wasPlayingBeforeLastTap) {
+      controller.play();
+      _isPausedByUser = false;
+      _syncPlaybackState(true);
+    } else {
+      controller.pause();
+      _isPausedByUser = true;
+      _syncPlaybackState(false);
+    }
+
+    _didToggleOnLastTap = false;
   }
 
   void _burstHeart() {
@@ -134,9 +241,39 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
   }
 
   Future<void> _disposeController() async {
+    _autoplayRecoveryTimer?.cancel();
+    _pendingPauseTimer?.cancel();
     final controller = _controller;
     _controller = null;
     await controller?.dispose();
+  }
+
+  void _scheduleAutoplayRecovery() {
+    _autoplayRecoveryTimer?.cancel();
+    _autoplayRecoveryTimer = Timer(_autoplayRecoveryDelay, () {
+      if (!mounted || !widget.active || _isPausedByUser) {
+        return;
+      }
+
+      final controller = _controller;
+      if (controller == null || !controller.value.isInitialized) {
+        return;
+      }
+
+      if (!controller.value.isPlaying) {
+        controller.play();
+      }
+      _syncPlaybackState(true);
+    });
+  }
+
+  void _syncPlaybackState(bool playing) {
+    if (!mounted || _isPlaying == playing) {
+      return;
+    }
+    setState(() {
+      _isPlaying = playing;
+    });
   }
 
   @override
@@ -172,18 +309,15 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onDoubleTap: _handleDoubleTap,
-      onTap: widget.clearMode ? widget.onToggleClearMode : null,
+      onTapUp: (_) => _handleTapUp(),
       child: Stack(
         fit: StackFit.expand,
         children: [
           ColoredBox(
             color: Colors.black,
-            child: FittedBox(
-              fit: BoxFit.cover,
-              child: SizedBox(
-                width: controller.value.size.width,
-                height: controller.value.size.height,
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: controller.value.aspectRatio,
                 child: VideoPlayer(controller),
               ),
             ),
@@ -210,6 +344,28 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
                 Icons.favorite_rounded,
                 size: 108,
                 color: Color(0xE6FF5678),
+              ),
+            ),
+          ),
+          AnimatedOpacity(
+            opacity: _isPlaying ? 0 : 1,
+            duration: const Duration(milliseconds: 180),
+            child: IgnorePointer(
+              child: Center(
+                child: Container(
+                  width: 78,
+                  height: 78,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0x88050B10),
+                    border: Border.all(color: Colors.white24),
+                  ),
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Colors.white,
+                    size: 42,
+                  ),
+                ),
               ),
             ),
           ),
