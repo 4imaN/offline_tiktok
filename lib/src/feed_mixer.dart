@@ -7,11 +7,13 @@ class MixedVideo {
     required this.asset,
     required this.score,
     required this.label,
+    required this.syncId,
   });
 
   final AssetEntity asset;
   final double score;
   final String label;
+  final String syncId;
 }
 
 List<MixedVideo> buildOfflineMix(List<AssetEntity> assets, {DateTime? now}) {
@@ -35,6 +37,7 @@ List<MixedVideo> buildOfflineMix(List<AssetEntity> assets, {DateTime? now}) {
       asset: asset,
       score: score,
       label: _labelFor(freshness, durationScore, surprise),
+      syncId: buildVideoSyncId(asset),
     );
   }).toList()..sort((left, right) => right.score.compareTo(left.score));
 
@@ -117,4 +120,9 @@ int _hash(String value) {
     hash *= 16777619;
   }
   return hash & 0x7fffffff;
+}
+
+String buildVideoSyncId(AssetEntity asset) {
+  final title = (asset.title ?? '').trim().toLowerCase();
+  return [title, asset.duration, asset.width, asset.height].join('|');
 }

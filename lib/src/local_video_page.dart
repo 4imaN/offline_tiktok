@@ -9,28 +9,42 @@ import 'feed_mixer.dart';
 class LocalVideoPage extends StatefulWidget {
   const LocalVideoPage({
     super.key,
-    required this.video,
+    this.video,
     required this.active,
-    required this.isFavorite,
-    required this.clearMode,
-    required this.soundOn,
-    required this.onToggleFavorite,
-    required this.onDoubleTapLike,
-    required this.onShare,
-    required this.onToggleClearMode,
-    required this.onToggleSound,
+    this.isFavorite = false,
+    this.clearMode = false,
+    this.soundOn = true,
+    this.onToggleFavorite,
+    this.onDoubleTapLike,
+    this.onShare,
+    this.onToggleClearMode,
+    this.onToggleSound,
+    this.syncedPlaying,
+    this.syncTick = 0,
+    this.onPlaybackStateChanged,
+    this.streamUrl,
+    this.titleOverride,
+    this.labelOverride,
+    this.showActions = true,
   });
 
-  final MixedVideo video;
+  final MixedVideo? video;
   final bool active;
   final bool isFavorite;
   final bool clearMode;
   final bool soundOn;
-  final VoidCallback onToggleFavorite;
-  final VoidCallback onDoubleTapLike;
-  final VoidCallback onShare;
-  final VoidCallback onToggleClearMode;
-  final VoidCallback onToggleSound;
+  final VoidCallback? onToggleFavorite;
+  final VoidCallback? onDoubleTapLike;
+  final VoidCallback? onShare;
+  final VoidCallback? onToggleClearMode;
+  final VoidCallback? onToggleSound;
+  final bool? syncedPlaying;
+  final int syncTick;
+  final ValueChanged<bool>? onPlaybackStateChanged;
+  final String? streamUrl;
+  final String? titleOverride;
+  final String? labelOverride;
+  final bool showActions;
 
   @override
   State<LocalVideoPage> createState() => _LocalVideoPageState();
@@ -53,6 +67,7 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
   bool _showHeartBurst = false;
   int _heartBurstId = 0;
   DateTime? _lastTapAt;
+  int _lastAppliedSyncTick = -1;
 
   @override
   void initState() {
@@ -63,8 +78,11 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
   @override
   void didUpdateWidget(covariant LocalVideoPage oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.video.asset.id != widget.video.asset.id) {
+    final oldVideoId = oldWidget.video?.asset.id;
+    final newVideoId = widget.video?.asset.id;
+    if (oldVideoId != newVideoId || oldWidget.streamUrl != widget.streamUrl) {
       _disposeController();
+      _lastAppliedSyncTick = -1;
       _setup();
       return;
     }
@@ -76,6 +94,10 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
 
     if (oldWidget.soundOn != widget.soundOn) {
       controller.setVolume(widget.soundOn ? 1 : 0);
+    }
+
+    if (oldWidget.syncTick != widget.syncTick) {
+      _applyExternalPlaybackPreference();
     }
 
     if (widget.active) {
@@ -98,12 +120,23 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
     });
 
     try {
-      final file = await widget.video.asset.file;
-      if (file == null || !await File(file.path).exists()) {
-        throw Exception('This video is no longer available on the device.');
-      }
+      late final VideoPlayerController controller;
 
-      final controller = VideoPlayerController.file(file);
+      if (widget.streamUrl != null) {
+        controller = VideoPlayerController.networkUrl(
+          Uri.parse(widget.streamUrl!),
+        );
+      } else {
+        final asset = widget.video?.asset;
+        if (asset == null) {
+          throw Exception('No video source was provided.');
+        }
+        final file = await asset.file;
+        if (file == null || !await File(file.path).exists()) {
+          throw Exception('This video is no longer available on the device.');
+        }
+        controller = VideoPlayerController.file(file);
+      }
       await controller.initialize();
       await controller.setLooping(true);
       await controller.setVolume(widget.soundOn ? 1 : 0);
@@ -115,9 +148,17 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
 
       _controller = controller;
       if (widget.active) {
-        await controller.play();
-        _syncPlaybackState(true);
-        _scheduleAutoplayRecovery();
+        final shouldPlay = widget.syncedPlaying ?? true;
+        if (shouldPlay) {
+          await controller.play();
+          _isPausedByUser = false;
+          _syncPlaybackState(true);
+          _scheduleAutoplayRecovery();
+        } else {
+          await controller.pause();
+          _isPausedByUser = true;
+          _syncPlaybackState(false);
+        }
       } else {
         _syncPlaybackState(false);
       }
@@ -138,7 +179,7 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
     _restorePlaybackAfterDoubleTap();
     _burstHeart();
     if (!widget.isFavorite) {
-      widget.onDoubleTapLike();
+      widget.onDoubleTapLike?.call();
     }
   }
 
@@ -159,7 +200,7 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
   void _handleSingleTap() {
     if (widget.clearMode) {
       _didToggleOnLastTap = false;
-      widget.onToggleClearMode();
+      widget.onToggleClearMode?.call();
       return;
     }
 
@@ -274,6 +315,39 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
     setState(() {
       _isPlaying = playing;
     });
+    widget.onPlaybackStateChanged?.call(playing);
+  }
+
+  Future<void> _applyExternalPlaybackPreference() async {
+    if (_lastAppliedSyncTick == widget.syncTick) {
+      return;
+    }
+    _lastAppliedSyncTick = widget.syncTick;
+
+    final controller = _controller;
+    if (controller == null ||
+        !controller.value.isInitialized ||
+        !widget.active) {
+      return;
+    }
+
+    final shouldPlay = widget.syncedPlaying;
+    if (shouldPlay == null) {
+      return;
+    }
+
+    if (shouldPlay) {
+      await controller.play();
+      _isPausedByUser = false;
+      _syncPlaybackState(true);
+      _scheduleAutoplayRecovery();
+      return;
+    }
+
+    await controller.pause();
+    _autoplayRecoveryTimer?.cancel();
+    _isPausedByUser = true;
+    _syncPlaybackState(false);
   }
 
   @override
@@ -392,15 +466,15 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
                             borderRadius: BorderRadius.circular(999),
                           ),
                           child: Text(
-                            widget.video.label,
+                            widget.labelOverride ??
+                                widget.video?.label ??
+                                'Live',
                             style: Theme.of(context).textTheme.labelLarge,
                           ),
                         ),
                         const SizedBox(height: 12),
                         Text(
-                          widget.video.asset.title?.trim().isNotEmpty == true
-                              ? widget.video.asset.title!
-                              : 'Offline video',
+                          _resolvedTitle,
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.headlineSmall
@@ -408,28 +482,51 @@ class _LocalVideoPageState extends State<LocalVideoPage> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Mix score ${(widget.video.score * 100).round()} · double tap to like',
+                          _resolvedSubtitle,
                           style: Theme.of(context).textTheme.bodyMedium
                               ?.copyWith(color: Colors.white70),
                         ),
                       ],
                     ),
                   ),
-                  const SizedBox(width: 18),
-                  _ActionRail(
-                    isFavorite: widget.isFavorite,
-                    soundOn: widget.soundOn,
-                    onToggleFavorite: widget.onToggleFavorite,
-                    onShare: widget.onShare,
-                    onToggleClearMode: widget.onToggleClearMode,
-                    onToggleSound: widget.onToggleSound,
-                  ),
+                  if (widget.showActions) ...[
+                    const SizedBox(width: 18),
+                    _ActionRail(
+                      isFavorite: widget.isFavorite,
+                      soundOn: widget.soundOn,
+                      onToggleFavorite: widget.onToggleFavorite,
+                      onShare: widget.onShare,
+                      onToggleClearMode: widget.onToggleClearMode,
+                      onToggleSound: widget.onToggleSound,
+                    ),
+                  ],
                 ],
               ),
             ),
         ],
       ),
     );
+  }
+
+  String get _resolvedTitle {
+    if (widget.titleOverride?.trim().isNotEmpty == true) {
+      return widget.titleOverride!;
+    }
+    if (widget.video?.asset.title?.trim().isNotEmpty == true) {
+      return widget.video!.asset.title!;
+    }
+    return widget.streamUrl == null ? 'Offline video' : 'Nearby stream';
+  }
+
+  String get _resolvedSubtitle {
+    if (widget.streamUrl != null) {
+      return 'Streaming from a nearby host on your Wi-Fi network';
+    }
+    final score = widget.video?.score;
+    if (score == null) {
+      return 'double tap to like';
+    }
+    return 'Mix score ${(score * 100).round()} · double tap to like';
   }
 }
 
@@ -445,10 +542,10 @@ class _ActionRail extends StatelessWidget {
 
   final bool isFavorite;
   final bool soundOn;
-  final VoidCallback onToggleFavorite;
-  final VoidCallback onShare;
-  final VoidCallback onToggleClearMode;
-  final VoidCallback onToggleSound;
+  final VoidCallback? onToggleFavorite;
+  final VoidCallback? onShare;
+  final VoidCallback? onToggleClearMode;
+  final VoidCallback? onToggleSound;
 
   @override
   Widget build(BuildContext context) {

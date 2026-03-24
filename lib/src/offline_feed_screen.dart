@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'feed_mixer.dart';
 import 'local_video_page.dart';
+import 'nearby_watch_service.dart';
 
 enum _FeedState { loading, permissionNeeded, empty, ready, error }
 
@@ -28,6 +29,8 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
   final PageController _likedController = PageController();
   late final TabController _tabController;
   late final Future<SharedPreferences> _preferences;
+  late final NearbyWatchService _nearbyWatchService;
+  StreamSubscription<RemoteWatchSnapshot>? _remoteSyncSubscription;
 
   _FeedState _state = _FeedState.loading;
   List<MixedVideo> _videos = const [];
@@ -37,18 +40,29 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
   bool _clearMode = false;
   bool _soundOn = true;
   String? _errorMessage;
+  bool? _partyPlaybackOverride;
+  int _partySyncTick = 0;
+  String? _partyMessage;
+  String? _remoteStreamUrl;
+  String? _remoteVideoTitle;
 
   @override
   void initState() {
     super.initState();
     _preferences = SharedPreferences.getInstance();
     _tabController = TabController(length: 2, vsync: this);
+    _nearbyWatchService = NearbyWatchService();
+    _remoteSyncSubscription = _nearbyWatchService.remoteSyncStream.listen(
+      _applyRemoteSnapshot,
+    );
     unawaited(_restoreFavorites());
     _loadFeed();
   }
 
   @override
   void dispose() {
+    _remoteSyncSubscription?.cancel();
+    _nearbyWatchService.dispose();
     _forYouController.dispose();
     _likedController.dispose();
     _tabController.dispose();
@@ -196,8 +210,7 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
           start = end;
         }
       }
-    } finally {
-    }
+    } finally {}
   }
 
   void _applyExpandedFeed(List<AssetEntity> allAssets) {
@@ -234,6 +247,7 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
       }
       _resetToFirstPage(_forYouController);
     });
+    _broadcastCurrentSnapshot();
   }
 
   void _normalizeLikedIndex() {
@@ -255,6 +269,216 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
     unawaited(_persistFavorites());
   }
 
+  String get _deviceLabel {
+    final suffix = DateTime.now().millisecondsSinceEpoch % 1000;
+    return 'Phone $suffix';
+  }
+
+  Future<void> _startHostingNearby() async {
+    try {
+      await _nearbyWatchService.startHosting(displayName: _deviceLabel);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _partyMessage =
+            'Nearby watch party is live on this Wi-Fi network. Joined phones will stream the clip you are currently watching.';
+      });
+      unawaited(_broadcastCurrentSnapshot());
+    } catch (error) {
+      _showSnack('Unable to start hosting right now: $error');
+    }
+  }
+
+  Future<void> _startLookingForNearby() async {
+    try {
+      await _nearbyWatchService.startDiscovery(displayName: _deviceLabel);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _partyMessage =
+            'Looking for nearby watch parties on this Wi-Fi network.';
+      });
+    } catch (error) {
+      _showSnack('Unable to search for nearby sessions: $error');
+    }
+  }
+
+  Future<void> _joinNearby(NearbySessionAnnouncement session) async {
+    try {
+      await _nearbyWatchService.joinSession(session);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _partyMessage =
+            'Joined ${session.hostName}. Video will stream directly from the host over Wi-Fi.';
+      });
+    } catch (error) {
+      _showSnack('Unable to join that session: $error');
+    }
+  }
+
+  Future<void> _stopNearbyWatchParty() async {
+    await _nearbyWatchService.stop();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _partyMessage = null;
+      _partyPlaybackOverride = null;
+      _partySyncTick++;
+      _remoteStreamUrl = null;
+      _remoteVideoTitle = null;
+    });
+  }
+
+  void _applyRemoteSnapshot(RemoteWatchSnapshot snapshot) {
+    if (!mounted) {
+      return;
+    }
+    final streamUrl = _nearbyWatchService.currentStreamUrlFor(snapshot);
+    if (streamUrl == null) {
+      _showSnack('The nearby host did not expose a playable stream.');
+      return;
+    }
+
+    setState(() {
+      _remoteStreamUrl = streamUrl;
+      _remoteVideoTitle = snapshot.videoTitle;
+      _partyPlaybackOverride = snapshot.playing;
+      _partySyncTick++;
+      _partyMessage =
+          'Streaming from ${_nearbyWatchService.connectedHostLabel}.';
+    });
+  }
+
+  Future<void> _broadcastCurrentSnapshot() async {
+    if (_nearbyWatchService.mode != NearbyWatchMode.hosting ||
+        _videos.isEmpty) {
+      return;
+    }
+
+    final index = _forYouIndex.clamp(0, _videos.length - 1);
+    final video = _videos[index];
+    await _nearbyWatchService.updateHostedVideo(
+      video,
+      playing: _partyPlaybackOverride ?? true,
+    );
+  }
+
+  void _showNearbySheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF0B1A26),
+      isScrollControlled: true,
+      builder: (context) {
+        return AnimatedBuilder(
+          animation: _nearbyWatchService,
+          builder: (context, _) {
+            final sessions = _nearbyWatchService.discoveredSessions;
+            final mode = _nearbyWatchService.mode;
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Nearby Watch Party',
+                      style: Theme.of(context).textTheme.headlineSmall
+                          ?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Streaming version: the host serves the current clip over Wi-Fi so other nearby phones can watch even without the same local file.',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyMedium?.copyWith(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 18),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: _startHostingNearby,
+                          icon: const Icon(Icons.wifi_tethering_rounded),
+                          label: const Text('Host'),
+                        ),
+                        FilledButton.icon(
+                          onPressed: _startLookingForNearby,
+                          icon: const Icon(Icons.radar_rounded),
+                          label: const Text('Find Nearby'),
+                        ),
+                        if (mode != NearbyWatchMode.idle)
+                          OutlinedButton.icon(
+                            onPressed: _stopNearbyWatchParty,
+                            icon: const Icon(Icons.close_rounded),
+                            label: const Text('Stop'),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    if (_nearbyWatchService.statusText != null)
+                      Text(
+                        _nearbyWatchService.statusText!,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: const Color(0xFF9EE7DA),
+                        ),
+                      ),
+                    if (mode == NearbyWatchMode.discovering) ...[
+                      const SizedBox(height: 14),
+                      if (sessions.isEmpty)
+                        Text(
+                          'No sessions found yet. Make sure the host is on the same Wi-Fi and has started hosting.',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(color: Colors.white70),
+                        ),
+                      for (final session in sessions)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF102232),
+                              borderRadius: BorderRadius.circular(18),
+                              border: Border.all(color: Colors.white10),
+                            ),
+                            child: ListTile(
+                              title: Text(session.hostName),
+                              subtitle: Text(
+                                '${session.address.address} · streaming enabled',
+                              ),
+                              trailing: FilledButton(
+                                onPressed: () => _joinNearby(session),
+                                child: const Text('Join'),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
   void _likeFromDoubleTap(String assetId) {
     if (_favoriteIds.contains(assetId)) {
       return;
@@ -268,7 +492,8 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
 
   Future<void> _restoreFavorites() async {
     final preferences = await _preferences;
-    final stored = preferences.getStringList(_favoriteIdsStorageKey) ?? const [];
+    final stored =
+        preferences.getStringList(_favoriteIdsStorageKey) ?? const [];
     if (!mounted) {
       return;
     }
@@ -325,6 +550,43 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
         .toList(growable: false);
   }
 
+  bool get _isWatchingRemote =>
+      _nearbyWatchService.mode == NearbyWatchMode.connected &&
+      _remoteStreamUrl != null;
+
+  Widget _buildRemoteWatchPage() {
+    if (_remoteStreamUrl == null) {
+      return const _SimpleEmptyState(
+        title: 'Waiting for host video',
+        body:
+            'Join a nearby host and wait for them to open a clip. The stream will appear here automatically.',
+      );
+    }
+
+    return LocalVideoPage(
+      key: ValueKey(_remoteStreamUrl),
+      streamUrl: _remoteStreamUrl,
+      titleOverride: _remoteVideoTitle ?? 'Nearby stream',
+      labelOverride: 'Watch Party',
+      showActions: false,
+      active: true,
+      clearMode: _clearMode,
+      soundOn: _soundOn,
+      syncedPlaying: _partyPlaybackOverride,
+      syncTick: _partySyncTick,
+      onToggleClearMode: () {
+        setState(() {
+          _clearMode = !_clearMode;
+        });
+      },
+      onToggleSound: () {
+        setState(() {
+          _soundOn = !_soundOn;
+        });
+      },
+    );
+  }
+
   Widget _buildFeed({
     required List<MixedVideo> videos,
     required PageController controller,
@@ -351,9 +613,18 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
           isFavorite: _favoriteIds.contains(video.asset.id),
           clearMode: _clearMode,
           soundOn: _soundOn,
+          syncedPlaying: index == _forYouIndex ? _partyPlaybackOverride : null,
+          syncTick: index == _forYouIndex ? _partySyncTick : 0,
           onToggleFavorite: () => _toggleFavorite(video.asset.id),
           onDoubleTapLike: () => _likeFromDoubleTap(video.asset.id),
           onShare: () => _shareVideo(video),
+          onPlaybackStateChanged: (playing) {
+            if (index != _forYouIndex) {
+              return;
+            }
+            _partyPlaybackOverride = playing;
+            unawaited(_broadcastCurrentSnapshot());
+          },
           onToggleClearMode: () {
             setState(() {
               _clearMode = !_clearMode;
@@ -412,19 +683,22 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
                     ? const NeverScrollableScrollPhysics()
                     : null,
                 children: [
-                  _buildFeed(
-                    videos: _videos,
-                    controller: _forYouController,
-                    currentIndex: _forYouIndex,
-                    onPageChanged: (index) {
-                      setState(() {
-                        _forYouIndex = index;
-                      });
-                    },
-                    emptyTitle: 'No local videos found',
-                    emptyBody:
-                        'Download or copy TikTok videos into your gallery to build your For You feed.',
-                  ),
+                  _isWatchingRemote
+                      ? _buildRemoteWatchPage()
+                      : _buildFeed(
+                          videos: _videos,
+                          controller: _forYouController,
+                          currentIndex: _forYouIndex,
+                          onPageChanged: (index) {
+                            setState(() {
+                              _forYouIndex = index;
+                            });
+                            unawaited(_broadcastCurrentSnapshot());
+                          },
+                          emptyTitle: 'No local videos found',
+                          emptyBody:
+                              'Download or copy TikTok videos into your gallery to build your For You feed.',
+                        ),
                   _buildFeed(
                     videos: _likedVideos,
                     controller: _likedController,
@@ -458,9 +732,7 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
                           dividerColor: Colors.transparent,
                           labelColor: Colors.white,
                           unselectedLabelColor: Colors.white70,
-                          labelStyle: Theme.of(context)
-                              .textTheme
-                              .titleMedium
+                          labelStyle: Theme.of(context).textTheme.titleMedium
                               ?.copyWith(fontWeight: FontWeight.w800),
                           unselectedLabelStyle: Theme.of(context)
                               .textTheme
@@ -483,8 +755,34 @@ class _OfflineFeedScreenState extends State<OfflineFeedScreen>
                               icon: Icons.shuffle_rounded,
                               onPressed: _reshuffle,
                             ),
+                            const SizedBox(width: 10),
+                            _PillButton(
+                              label: 'Nearby',
+                              icon: Icons.groups_rounded,
+                              onPressed: _showNearbySheet,
+                            ),
                           ],
                         ),
+                        if (_partyMessage != null) ...[
+                          const SizedBox(height: 14),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xB30D2C39),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(color: Colors.white12),
+                            ),
+                            child: Text(
+                              _partyMessage!,
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: Colors.white70),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ),
