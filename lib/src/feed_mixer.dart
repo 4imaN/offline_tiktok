@@ -1,5 +1,4 @@
 import 'dart:math';
-
 import 'package:photo_manager/photo_manager.dart';
 
 class MixedVideo {
